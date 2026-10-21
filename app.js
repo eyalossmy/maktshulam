@@ -1,130 +1,60 @@
-// מקטשולם — ניהול מק״טים. Data lives in IndexedDB on this device.
-// Duplicates are blocked in two layers: live checks in the UI, and unique
-// indexes on the normalized name and SKU keys inside the database itself.
+// מקטשולם — ניהול מק״טים. Data lives in Postgres behind /api.
+// Duplicates are checked live here with the same rules the API enforces
+// (lib/rules.js), and the API re-checks every save inside a locked transaction.
 
-const DB_NAME = 'maktshulam';
-const STORE = 'items';
-const PHOTO_MAX = 1000;          // longest edge of stored photos, px
-const PHOTO_HAMMING_MAX = 4;     // dHash distance at or below which two photos count as the same
-const NAME_SIMILAR_MAX = 1;      // edit distance that triggers a "very similar name" warning
+import { clean, nameKey, codeKey, normalizeUrl, findConflicts } from '/lib/rules.js';
+
+const PHOTO_MAX = 900;           // longest edge of stored photos, px
+const REFRESH_MS = 30000;
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const el = {
   grid: $('#grid'), empty: $('#empty'), noResults: $('#noResults'),
-  count: $('#count'), photoCount: $('#photoCount'), search: $('#search'),
+  count: $('#count'), skuCount: $('#skuCount'), search: $('#search'),
   editor: $('#editor'), form: $('#form'), formTitle: $('#formTitle'),
   drop: $('#drop'), photo: $('#photo'), preview: $('#preview'), clearPhoto: $('#clearPhoto'),
   dropBusy: $('.drop-busy'), photoMsg: $('#photoMsg'),
   name: $('#name'), nameField: $('#nameField'), nameMsg: $('#nameMsg'),
   sku: $('#sku'), skuField: $('#skuField'), skuMsg: $('#skuMsg'), genSku: $('#genSku'),
-  save: $('#saveBtn'), del: $('#deleteBtn'),
-  menuBtn: $('#menuBtn'), menu: $('#menu'), importFile: $('#importFile'), toasts: $('#toasts'),
+  unit: $('#unitId'), unitField: $('#unitField'), unitMsg: $('#unitMsg'), genUnit: $('#genUnit'),
+  url: $('#url'), urlField: $('#urlField'), urlMsg: $('#urlMsg'),
+  save: $('#saveBtn'), del: $('#deleteBtn'), clone: $('#cloneBtn'),
+  exportBtn: $('#exportBtn'), toasts: $('#toasts'),
 };
 
-let db;
-let items = [];                   // sorted newest first
-const urls = new Map();           // id -> object URL for its photo
+let items = [];                   // newest first, as returned by the API
+let loaded = false;
 let editing = null;               // item being edited, or null when adding
-let draft = { photo: null, hash: null, url: null, dirty: false };
-const channel = 'BroadcastChannel' in window ? new BroadcastChannel('maktshulam') : null;
+let saving = false;
+// photo: "keep" | "clear" | { blob, hash, url } (new upload) | { from, hash, url } (reuse another unit's photo)
+let draft = { photo: 'keep' };
 
-/* ---------------- Normalization & comparison ---------------- */
+/* ---------------- API ---------------- */
 
-const stripMarks = s => s.normalize('NFKD').replace(/[֑-ׇ̀-ͯ]/g, '');
-const clean = s => s.replace(/\s+/g, ' ').trim();
-
-// "כוס  זכוכית" / "כוס-זכוכית" / "כּוֹס זכוכית" all map to the same key
-function nameKey(name) {
-  return stripMarks(name).toLowerCase()
-    .replace(/[״"'`׳\-_.,:;/\\()[\]{}|+*!?]/g, ' ')
-    .replace(/\s+/g, ' ').trim();
-}
-
-// "mk-100 24" / "MK10024" / "Mk.10024" all map to the same key
-function skuKey(sku) {
-  return stripMarks(sku).toUpperCase().replace(/[\s\-_./\\|]/g, '');
-}
-
-function levenshtein(a, b, cap) {
-  if (Math.abs(a.length - b.length) > cap) return cap + 1;
-  let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
-  for (let i = 1; i <= a.length; i++) {
-    const cur = [i];
-    let rowMin = i;
-    for (let j = 1; j <= b.length; j++) {
-      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
-      rowMin = Math.min(rowMin, cur[j]);
-    }
-    if (rowMin > cap) return cap + 1;
-    prev = cur;
-  }
-  return prev[b.length];
-}
-
-function popcount(n) { let c = 0; while (n) { c += Number(n & 1n); n >>= 1n; } return c; }
-const hamming = (a, b) => popcount(BigInt('0x' + a) ^ BigInt('0x' + b));
-
-// Photo fingerprints are either a 16-char perceptual hash (compared loosely)
-// or "x" + SHA-256 for low-detail images (compared exactly).
-function samePhoto(a, b) {
-  if (a.length === 16 && b.length === 16) return hamming(a, b) <= PHOTO_HAMMING_MAX;
-  return a === b;
-}
-
-function findConflicts({ name, sku, hash }, selfId) {
-  const nk = nameKey(name || ''), sk = skuKey(sku || '');
-  const out = { name: null, similar: null, sku: null, photo: null };
-  for (const it of items) {
-    if (it.id === selfId) continue;
-    if (nk && it.nameKey === nk) out.name = it;
-    else if (nk.length >= 4 && !out.similar && levenshtein(nk, it.nameKey, NAME_SIMILAR_MAX) <= NAME_SIMILAR_MAX) out.similar = it;
-    if (sk && it.skuKey === sk) out.sku = it;
-    if (hash && it.photoHash && !out.photo && samePhoto(hash, it.photoHash)) out.photo = it;
-  }
-  return out;
-}
-
-/* ---------------- IndexedDB ---------------- */
-
-function openDb() {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, 1);
-    req.onupgradeneeded = () => {
-      const store = req.result.createObjectStore(STORE, { keyPath: 'id' });
-      store.createIndex('nameKey', 'nameKey', { unique: true });
-      store.createIndex('skuKey', 'skuKey', { unique: true });
-    };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
+async function api(path, opts = {}) {
+  const res = await fetch(path, {
+    ...opts,
+    headers: opts.body ? { 'Content-Type': 'application/json' } : undefined,
   });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw Object.assign(new Error(data.error || 'שגיאת רשת'), { status: res.status, data });
+  return data;
 }
-
-function run(mode, fn) {
-  return new Promise((resolve, reject) => {
-    const t = db.transaction(STORE, mode);
-    const req = fn(t.objectStore(STORE));
-    let result;
-    if (req) req.onsuccess = () => { result = req.result; };
-    t.oncomplete = () => resolve(result);
-    t.onabort = () => reject(t.error || req?.error);
-  });
-}
-
-const getAll = () => run('readonly', s => s.getAll());
-const putItem = item => run('readwrite', s => s.put(item));
-const deleteItem = id => run('readwrite', s => s.delete(id));
 
 async function reload() {
-  items = (await getAll()).sort((a, b) => b.createdAt - a.createdAt);
-  const live = new Set(items.map(i => i.id));
-  for (const [id, url] of urls) if (!live.has(id)) { URL.revokeObjectURL(url); urls.delete(id); }
-  for (const it of items) {
-    if (it.photo && !urls.has(it.id)) urls.set(it.id, URL.createObjectURL(it.photo));
+  try {
+    const { items: list } = await api('/api/items');
+    items = list;
+    loaded = true;
+    render();
+    if (el.editor.open) validate();
+  } catch (err) {
+    if (!loaded) { render(); toast('לא ניתן לטעון את הפריטים: ' + err.message, { bad: true, ms: 8000 }); }
   }
-  render();
 }
 
-function photoUrl(it) { return it.photo ? urls.get(it.id) : null; }
+const photoUrl = it => it?.photo ? `/api/photo?id=${it.id}&v=${it.photoV}` : null;
+const siblingsOf = it => items.filter(i => i.skuKey === it.skuKey);
 
 /* ---------------- Images ---------------- */
 
@@ -138,16 +68,11 @@ async function processImage(file) {
   c.width = Math.round(bmp.width * scale);
   c.height = Math.round(bmp.height * scale);
   c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
-  let blob = await new Promise(r => c.toBlob(r, 'image/webp', 0.86));
-  if (!blob || blob.type !== 'image/webp') blob = await new Promise(r => c.toBlob(r, 'image/jpeg', 0.88));
+  let blob = await new Promise(r => c.toBlob(r, 'image/webp', 0.84));
+  if (!blob || blob.type !== 'image/webp') blob = await new Promise(r => c.toBlob(r, 'image/jpeg', 0.86));
   const hash = dhash(bmp) || await sha(blob);
   bmp.close?.();
   return { blob, hash };
-}
-
-async function sha(blob) {
-  const buf = await crypto.subtle.digest('SHA-256', await blob.arrayBuffer());
-  return 'x' + [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
 // 64-bit difference hash: survives resizing and re-compression, so the same
@@ -159,24 +84,33 @@ function dhash(source) {
   ctx.drawImage(source, 0, 0, 9, 8);
   const d = ctx.getImageData(0, 0, 9, 8).data;
   const g = i => d[i * 4] * 0.299 + d[i * 4 + 1] * 0.587 + d[i * 4 + 2] * 0.114;
-  let h = 0n;
+  let h = 0n, bits = 0;
   for (let y = 0; y < 8; y++) for (let x = 0; x < 8; x++) {
-    h = (h << 1n) | (g(y * 9 + x) > g(y * 9 + x + 1) ? 1n : 0n);
+    const bit = g(y * 9 + x) > g(y * 9 + x + 1);
+    h = (h << 1n) | (bit ? 1n : 0n);
+    bits += bit;
   }
-  const bits = popcount(h);
   if (bits < 4 || bits > 60) return null; // near-flat image: too little detail to compare
   return h.toString(16).padStart(16, '0');
 }
 
-async function hashBlob(blob) {
-  try { const bmp = await createImageBitmap(blob); const h = dhash(bmp); bmp.close?.(); return h || await sha(blob); }
-  catch { return null; }
+async function sha(blob) {
+  const buf = await crypto.subtle.digest('SHA-256', await blob.arrayBuffer());
+  return 'x' + [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
 }
+
+const blobToBase64 = blob => new Promise((res, rej) => {
+  const r = new FileReader();
+  r.onload = () => res(String(r.result).split(',')[1]);
+  r.onerror = () => rej(r.error);
+  r.readAsDataURL(blob);
+});
 
 /* ---------------- Rendering ---------------- */
 
-const esc = s => s.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const COPY_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="3"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg>';
+const LINK_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4h6v6M20 4l-9 9M18 14v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4"/></svg>';
 
 function highlight(text, q) {
   if (!q) return esc(text);
@@ -187,25 +121,37 @@ function highlight(text, q) {
 
 function render() {
   const q = clean(el.search.value);
-  const nq = nameKey(q), sq = skuKey(q);
+  const nq = nameKey(q), cq = codeKey(q);
   const shown = !q ? items : items.filter(it =>
-    (nq && it.nameKey.includes(nq)) || (sq && it.skuKey.includes(sq)));
+    (nq && it.nameKey.includes(nq)) || (cq && (it.skuKey.includes(cq) || it.unitKey.includes(cq))));
+  const perSku = new Map();
+  for (const it of items) perSku.set(it.skuKey, (perSku.get(it.skuKey) || 0) + 1);
 
   el.count.textContent = items.length.toLocaleString('he-IL');
-  el.photoCount.textContent = items.filter(i => i.photo).length.toLocaleString('he-IL');
-  el.empty.hidden = items.length > 0;
+  el.skuCount.textContent = perSku.size.toLocaleString('he-IL');
+  el.empty.hidden = !loaded || items.length > 0;
   el.noResults.hidden = !(items.length > 0 && shown.length === 0);
+
+  if (!loaded) {
+    el.grid.innerHTML = Array.from({ length: 4 }, () => '<div class="card skeleton"><div class="ph"></div><div class="meta"><i></i><i></i></div></div>').join('');
+    return;
+  }
 
   el.grid.innerHTML = shown.map((it, i) => {
     const url = photoUrl(it);
+    const units = perSku.get(it.skuKey);
     const ph = url
       ? `<img src="${url}" alt="" loading="lazy" decoding="async">`
       : `<span class="initial" aria-hidden="true">${esc([...it.name][0] || '')}</span>`;
-    return `<article class="card" data-id="${it.id}" tabindex="0" style="animation-delay:${Math.min(i, 12) * 25}ms" aria-label="${esc(it.name)}, מק״ט ${esc(it.sku)}">
-      <div class="ph">${ph}</div>
+    return `<article class="card" data-id="${it.id}" tabindex="0" style="animation-delay:${Math.min(i, 12) * 25}ms" aria-label="${esc(it.name)}, מק״ט ${esc(it.sku)}, ID ${esc(it.unitId)}">
+      <div class="ph">${ph}${units > 1 ? `<span class="units" title="יחידות במק״ט הזה">${units} יח׳</span>` : ''}</div>
       <div class="meta">
         <h3>${highlight(it.name, q)}</h3>
-        <button type="button" class="sku" data-copy="${esc(it.sku)}" title="העתקת מק״ט"><span class="t">${highlight(it.sku, q)}</span>${COPY_ICON}</button>
+        <div class="codes">
+          <button type="button" class="sku" data-copy="${esc(it.sku)}" title="העתקת מק״ט"><span class="t">${highlight(it.sku, q)}</span>${COPY_ICON}</button>
+          ${it.url ? `<a class="link-btn" href="${esc(it.url)}" target="_blank" rel="noopener noreferrer" title="${esc(it.url)}" aria-label="פתיחת קישור">${LINK_ICON}</a>` : ''}
+        </div>
+        <div class="unit"><span class="lbl">ID</span><button type="button" class="unit-id" data-copy="${esc(it.unitId)}" title="העתקת ID">${highlight(it.unitId, q)}</button></div>
       </div>
     </article>`;
   }).join('');
@@ -213,46 +159,52 @@ function render() {
 
 /* ---------------- Editor ---------------- */
 
-function openEditor(item = null) {
+function openEditor(item = null, prefill = null) {
   editing = item;
   el.form.reset();
-  el.formTitle.textContent = item ? 'עריכת פריט' : 'פריט חדש';
-  el.del.hidden = !item;
+  el.formTitle.textContent = item ? 'עריכת פריט' : prefill ? 'יחידה נוספת' : 'פריט חדש';
+  el.del.hidden = el.clone.hidden = !item;
   disarmDelete();
-  el.name.value = item?.name || '';
-  el.sku.value = item?.sku || '';
-  setDraftPhoto(item?.photo || null, item?.photoHash || null, false);
+  const src = item || prefill;
+  el.name.value = src?.name || '';
+  el.sku.value = src?.sku || '';
+  el.url.value = src?.url || '';
+  el.unit.value = item?.unitId || '';
+  if (item) setDraftPhoto('keep');
+  else if (prefill?.photo) setDraftPhoto({ from: prefill.id, hash: prefill.photoHash, url: photoUrl(prefill) });
+  else setDraftPhoto('clear');
+  if (prefill) el.unit.value = nextUnitId(prefill.sku);
   el.editor.showModal();
   validate();
-  if (!item) el.name.focus();
+  if (!item) (prefill ? el.unit : el.name).focus();
 }
 
-function closeEditor() {
-  el.editor.close();
-}
+function closeEditor() { el.editor.close(); }
 
 el.editor.addEventListener('close', () => {
-  if (draft.url && draft.dirty) URL.revokeObjectURL(draft.url);
-  draft = { photo: null, hash: null, url: null, dirty: false };
+  if (el.editor.open) return; // the close event is async; another item may already be open
+  setDraftPhoto('clear');
   editing = null;
 });
 
-function setDraftPhoto(blob, hash, dirty) {
-  if (draft.url && draft.dirty) URL.revokeObjectURL(draft.url);
-  const url = blob ? (dirty ? URL.createObjectURL(blob) : urls.get(editing?.id)) : null;
-  draft = { photo: blob, hash, url, dirty };
+function setDraftPhoto(photo) {
+  if (draft.photo?.blob) URL.revokeObjectURL(draft.photo.url);
+  draft = { photo };
+  const url = photo === 'keep' ? photoUrl(editing) : photo === 'clear' ? null : photo.url;
   el.preview.hidden = !url;
   if (url) el.preview.src = url; else el.preview.removeAttribute('src');
   el.drop.classList.toggle('has-photo', !!url);
   el.clearPhoto.hidden = !url;
 }
 
+const draftHash = () => draft.photo === 'keep' ? editing?.photoHash : draft.photo === 'clear' ? null : draft.photo.hash;
+
 async function acceptFile(file) {
   if (!file) return;
   el.dropBusy.hidden = false;
   try {
     const { blob, hash } = await processImage(file);
-    setDraftPhoto(blob, hash, true);
+    setDraftPhoto({ blob, hash, url: URL.createObjectURL(blob) });
     validate();
   } catch (err) {
     toast(err.message, { bad: true });
@@ -261,15 +213,15 @@ async function acceptFile(file) {
   }
 }
 
-function conflictLine(prefix, it, { jump = true } = {}) {
+function itemLine(prefix, it, { jump = true } = {}) {
   const url = photoUrl(it);
   const thumb = url ? `<img class="thumb" src="${url}" alt="">` : '';
   const btn = jump ? ` <button type="button" class="link" data-jump="${it.id}">פתיחה</button>` : '';
-  return `${thumb}<span>${prefix} <b>${esc(it.name)}</b> · <span class="code">${esc(it.sku)}</span>${btn}</span>`;
+  return `${thumb}<span>${prefix} <b>${esc(it.name)}</b> · <span class="code">${esc(it.sku)}</span> · <span class="code">${esc(it.unitId)}</span>${btn}</span>`;
 }
 
 function setField(field, msgEl, state, html = '') {
-  field.classList.remove('ok', 'bad', 'warn');
+  field.classList.remove('ok', 'bad', 'warn', 'info');
   if (state) field.classList.add(state);
   msgEl.className = 'msg' + (state ? ' ' + state : '');
   msgEl.innerHTML = html;
@@ -277,25 +229,50 @@ function setField(field, msgEl, state, html = '') {
 
 // Returns true when the form can be saved.
 function validate() {
-  const name = clean(el.name.value), sku = clean(el.sku.value);
-  const c = findConflicts({ name, sku, hash: draft.hash }, editing?.id);
+  const name = clean(el.name.value), sku = clean(el.sku.value), unitId = clean(el.unit.value);
+  const c = findConflicts(items, { name, sku, unitId, photoHash: draftHash() }, editing);
+  const sib = c.siblings;
+  const renaming = editing && codeKey(sku) === editing.skuKey && nameKey(name) && nameKey(name) !== editing.nameKey;
 
+  // Name
   if (!name) setField(el.nameField, el.nameMsg, null);
-  else if (c.name) setField(el.nameField, el.nameMsg, 'bad', conflictLine('השם כבר קיים:', c.name));
-  else if (c.similar) setField(el.nameField, el.nameMsg, 'warn', conflictLine('שם דומה מאוד קיים:', c.similar));
+  else if (c.name) setField(el.nameField, el.nameMsg, 'bad', itemLine('השם כבר שייך למק״ט אחר:', c.name));
+  else if (renaming && sib.length) setField(el.nameField, el.nameMsg, 'info', `השם יעודכן גם ב־${sib.length} היחידות האחרות של מק״ט זה`);
+  else if (c.similar) setField(el.nameField, el.nameMsg, 'warn', itemLine('שם דומה מאוד קיים:', c.similar));
   else setField(el.nameField, el.nameMsg, 'ok');
 
+  // מק״ט
   if (!sku) setField(el.skuField, el.skuMsg, null);
-  else if (!skuKey(sku)) setField(el.skuField, el.skuMsg, 'bad', 'מק״ט חייב לכלול אותיות או ספרות');
-  else if (c.sku) setField(el.skuField, el.skuMsg, 'bad', conflictLine('המק״ט כבר בשימוש:', c.sku));
-  else setField(el.skuField, el.skuMsg, 'ok', 'מק״ט פנוי');
+  else if (!codeKey(sku)) setField(el.skuField, el.skuMsg, 'bad', 'מק״ט חייב לכלול אותיות או ספרות');
+  else if (c.sku) setField(el.skuField, el.skuMsg, 'bad',
+    `<span>המק״ט רשום בשם <b>${esc(c.sku.name)}</b></span> <button type="button" class="link" data-use-name="${c.sku.id}">שימוש בשם הזה</button>`);
+  else if (sib.length) {
+    const ref = sib[0];
+    const fill = !editing && (!name || (draft.photo === 'clear' && ref.photo))
+      ? ` <button type="button" class="link" data-fill="${ref.id}">מילוי פרטים</button>` : '';
+    setField(el.skuField, el.skuMsg, 'info', `<span>מק״ט קיים · ${sib.length === 1 ? 'יחידה אחת' : sib.length + ' יחידות'}</span>${fill}`);
+  }
+  else setField(el.skuField, el.skuMsg, 'ok', 'מק״ט חדש');
 
+  // ID
+  if (!unitId) setField(el.unitField, el.unitMsg, null);
+  else if (!codeKey(unitId)) setField(el.unitField, el.unitMsg, 'bad', 'ID חייב לכלול אותיות או ספרות');
+  else if (c.unit) setField(el.unitField, el.unitMsg, 'bad', itemLine('ה־ID כבר קיים:', c.unit));
+  else setField(el.unitField, el.unitMsg, 'ok', 'ID פנוי');
+
+  // Link
+  const url = normalizeUrl(el.url.value);
+  if (!clean(el.url.value)) setField(el.urlField, el.urlMsg, null);
+  else if (url === null) setField(el.urlField, el.urlMsg, 'bad', 'קישור לא תקין');
+  else setField(el.urlField, el.urlMsg, 'ok');
+
+  // Photo
   el.drop.classList.toggle('bad', !!c.photo);
   el.photoMsg.className = 'msg' + (c.photo ? ' bad' : '');
-  el.photoMsg.innerHTML = c.photo ? conflictLine('התמונה כבר משויכת לפריט:', c.photo) : '';
+  el.photoMsg.innerHTML = c.photo ? itemLine('התמונה כבר שייכת למק״ט אחר:', c.photo) : '';
 
-  const ok = !!name && !!skuKey(sku) && !c.name && !c.sku && !c.photo;
-  el.save.disabled = !ok;
+  const ok = !!nameKey(name) && !!codeKey(sku) && !!codeKey(unitId) && url !== null && !c.blocked;
+  el.save.disabled = !ok || saving;
   return ok;
 }
 
@@ -305,45 +282,59 @@ function shake(field) {
   field.classList.add('shake');
 }
 
+function focusFirstProblem() {
+  for (const [field, input] of [[el.nameField, el.name], [el.skuField, el.sku], [el.unitField, el.unit], [el.urlField, el.url]]) {
+    if (!clean(input.value) && input !== el.url || field.classList.contains('bad')) { shake(field); input.focus(); return; }
+  }
+  if (el.drop.classList.contains('bad')) shake(el.drop);
+}
+
 async function save(e) {
   e.preventDefault();
-  const name = clean(el.name.value), sku = clean(el.sku.value).toUpperCase();
-  if (!validate()) {
-    if (!name || el.nameField.classList.contains('bad')) { shake(el.nameField); el.name.focus(); }
-    else { shake(el.skuField); el.sku.focus(); }
-    return;
-  }
-  const now = Date.now();
-  const record = {
-    id: editing?.id || crypto.randomUUID(),
-    name, sku,
-    nameKey: nameKey(name), skuKey: skuKey(sku),
-    photo: draft.photo, photoHash: draft.photo ? draft.hash : null,
-    createdAt: editing?.createdAt || now, updatedAt: now,
+  if (saving) return;
+  if (!validate()) return focusFirstProblem();
+
+  const body = {
+    name: el.name.value, sku: el.sku.value, unitId: el.unit.value, url: el.url.value,
   };
+  const p = draft.photo;
+  if (p === 'clear') body.photo = null;
+  else if (p?.from) body.photo = { from: p.from };
+  else if (p?.blob) body.photo = { data: await blobToBase64(p.blob), type: p.blob.type, hash: p.hash };
+
+  saving = true;
   el.save.disabled = true;
-  try {
-    await putItem(record);
-  } catch (err) {
-    if (err?.name === 'ConstraintError') {
-      // Another tab saved a conflicting item in the meantime; the database refused it.
-      await reload();
-      validate();
-      toast('נחסם: פריט עם אותו שם או מק״ט נוסף זה עתה', { bad: true });
-      return;
-    }
-    toast('השמירה נכשלה: ' + (err?.message || err), { bad: true });
-    validate();
-    return;
-  }
-  if (draft.dirty && draft.url) { URL.revokeObjectURL(draft.url); draft.url = null; }
-  if (urls.has(record.id)) { URL.revokeObjectURL(urls.get(record.id)); urls.delete(record.id); }
+  el.save.textContent = 'שומר…';
   const wasEditing = !!editing;
-  closeEditor();
-  await reload();
-  broadcast();
-  flashCard(record.id);
-  toast(wasEditing ? 'הפריט עודכן' : 'הפריט נוסף');
+  try {
+    const { item } = await api(editing ? `/api/items?id=${editing.id}` : '/api/items', {
+      method: editing ? 'PUT' : 'POST', body: JSON.stringify(body),
+    });
+    closeEditor();
+    await reload();
+    flashCard(item.id);
+    toast(wasEditing ? 'הפריט עודכן' : 'הפריט נוסף');
+  } catch (err) {
+    if (err.status === 409) {
+      // Someone else saved a conflicting item in the meantime; refresh and show it.
+      await reload();
+      toast('נחסם: ' + describeConflicts(err.data?.conflicts), { bad: true });
+    } else {
+      toast('השמירה נכשלה: ' + err.message, { bad: true });
+    }
+  } finally {
+    saving = false;
+    el.save.textContent = 'שמירה';
+    if (el.editor.open) validate();
+  }
+}
+
+function describeConflicts(c = {}) {
+  if (c.unit) return `ה־ID ${c.unit.unitId} כבר קיים`;
+  if (c.name) return `השם כבר שייך למק״ט ${c.name.sku}`;
+  if (c.sku) return `המק״ט רשום בשם ${c.sku.name}`;
+  if (c.photo) return `התמונה כבר שייכת למק״ט ${c.photo.sku}`;
+  return 'פריט כפול';
 }
 
 let deleteTimer;
@@ -363,17 +354,16 @@ async function onDelete() {
   }
   const item = editing;
   closeEditor();
-  await deleteItem(item.id);
+  try {
+    await api(`/api/items?id=${item.id}`, { method: 'DELETE' });
+    toast(`${item.name} · ${item.unitId} נמחק`);
+  } catch (err) {
+    toast('המחיקה נכשלה: ' + err.message, { bad: true });
+  }
   await reload();
-  broadcast();
-  toast(`"${item.name}" נמחק`, {
-    action: 'ביטול',
-    onAction: async () => {
-      try { await putItem(item); await reload(); broadcast(); flashCard(item.id); }
-      catch { toast('לא ניתן לשחזר: השם או המק״ט כבר בשימוש', { bad: true }); }
-    },
-  });
 }
+
+/* ---------------- Code generators ---------------- */
 
 function nextSku() {
   const taken = new Set(items.map(i => i.skuKey));
@@ -387,23 +377,44 @@ function nextSku() {
   return 'MK-' + n;
 }
 
+// Units of מק״ט "EVO-DRONE" get IDs EVO-DRONE-001, EVO-DRONE-002, …
+function nextUnitId(sku) {
+  const base = clean(sku).toUpperCase().replace(/\s+/g, '-') || 'ID';
+  const taken = new Set(items.map(i => i.unitKey));
+  let n = 1;
+  while (taken.has(codeKey(`${base}-${String(n).padStart(3, '0')}`))) n++;
+  return `${base}-${String(n).padStart(3, '0')}`;
+}
+
+/* ---------------- Export ---------------- */
+
+function exportCsv() {
+  if (!items.length) return toast('אין פריטים לייצוא');
+  const cell = v => /[",\n\r]/.test(v = String(v ?? '')) ? `"${v.replace(/"/g, '""')}"` : v;
+  const rows = [['שם', 'מק״ט', 'ID', 'קישור', 'תמונה', 'נוסף בתאריך']];
+  for (const it of [...items].sort((a, b) => a.sku.localeCompare(b.sku) || a.unitId.localeCompare(b.unitId))) {
+    rows.push([it.name, it.sku, it.unitId, it.url, it.photo ? new URL(photoUrl(it), location.origin).href : '',
+      new Date(it.createdAt).toLocaleDateString('he-IL')]);
+  }
+  // BOM so Excel opens the Hebrew correctly
+  const csv = '﻿' + rows.map(r => r.map(cell).join(',')).join('\r\n');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+  a.download = `maktshulam-${new Date().toISOString().slice(0, 10)}.csv`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  toast(`יוצאו ${items.length} פריטים לקובץ אקסל`);
+}
+
 /* ---------------- Toasts & misc ---------------- */
 
-function toast(text, { bad = false, action, onAction, ms = 4200 } = {}) {
+function toast(text, { bad = false, ms = 4200 } = {}) {
   const t = document.createElement('div');
   t.className = 'toast' + (bad ? ' bad' : '');
   t.setAttribute('role', bad ? 'alert' : 'status');
   t.innerHTML = `<span>${esc(text)}</span>`;
-  const dismiss = () => { t.classList.add('out'); setTimeout(() => t.remove(), 200); };
-  if (action) {
-    const b = document.createElement('button');
-    b.type = 'button';
-    b.textContent = action;
-    b.onclick = () => { dismiss(); onAction(); };
-    t.append(b);
-  }
   el.toasts.append(t);
-  setTimeout(dismiss, action ? ms + 2000 : ms);
+  setTimeout(() => { t.classList.add('out'); setTimeout(() => t.remove(), 200); }, ms);
 }
 
 function flashCard(id) {
@@ -414,114 +425,61 @@ function flashCard(id) {
   setTimeout(() => card.classList.remove('flash'), 1400);
 }
 
-function broadcast() { channel?.postMessage('changed'); }
-
-/* ---------------- Backup ---------------- */
-
-const blobToDataUrl = blob => new Promise((res, rej) => {
-  const r = new FileReader(); r.onload = () => res(r.result); r.onerror = () => rej(r.error); r.readAsDataURL(blob);
-});
-
-async function exportBackup() {
-  const out = [];
-  for (const it of items) {
-    out.push({ name: it.name, sku: it.sku, photo: it.photo ? await blobToDataUrl(it.photo) : null, photoHash: it.photoHash, createdAt: it.createdAt });
-  }
-  const blob = new Blob([JSON.stringify({ app: 'maktshulam', version: 1, exportedAt: new Date().toISOString(), items: out })], { type: 'application/json' });
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = `maktshulam-${new Date().toISOString().slice(0, 10)}.json`;
-  a.click();
-  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
-  toast(`יוצאו ${items.length} פריטים`);
-}
-
-async function importBackup(file) {
-  let data;
-  try { data = JSON.parse(await file.text()); } catch { return toast('קובץ הגיבוי אינו תקין', { bad: true }); }
-  const list = Array.isArray(data?.items) ? data.items : null;
-  if (!list) return toast('קובץ הגיבוי אינו תקין', { bad: true });
-  let added = 0, blocked = 0;
-  for (const raw of list) {
-    const name = clean(String(raw?.name || '')), sku = clean(String(raw?.sku || '')).toUpperCase();
-    if (!name || !skuKey(sku)) { blocked++; continue; }
-    let photo = null, photoHash = null;
-    if (typeof raw.photo === 'string' && raw.photo.startsWith('data:image/')) {
-      photo = await (await fetch(raw.photo)).blob();
-      photoHash = await hashBlob(photo);
-    }
-    const c = findConflicts({ name, sku, hash: photoHash });
-    if (c.name || c.sku || c.photo) { blocked++; continue; }
-    const now = Date.now();
-    const rec = { id: crypto.randomUUID(), name, sku, nameKey: nameKey(name), skuKey: skuKey(sku), photo, photoHash, createdAt: Number(raw.createdAt) || now, updatedAt: now };
-    try { await putItem(rec); items.push(rec); added++; } catch { blocked++; }
-  }
-  await reload();
-  broadcast();
-  toast(blocked ? `יובאו ${added} פריטים · ${blocked} כפולים או פגומים נחסמו` : `יובאו ${added} פריטים`);
-}
-
 /* ---------------- Events ---------------- */
-
-function toggleMenu(open = el.menu.hidden) {
-  el.menu.hidden = !open;
-  el.menuBtn.setAttribute('aria-expanded', String(open));
-}
 
 function bind() {
   $('#addBtn').addEventListener('click', () => openEditor());
   document.addEventListener('click', e => {
     if (e.target.closest('[data-action="add"]')) openEditor();
-    if (!e.target.closest('.menu-wrap')) toggleMenu(false);
   });
-
-  el.menuBtn.addEventListener('click', () => toggleMenu());
-  el.menu.addEventListener('click', e => {
-    const a = e.target.closest('[data-action]')?.dataset.action;
-    toggleMenu(false);
-    if (a === 'export') exportBackup();
-    if (a === 'import') el.importFile.click();
-  });
-  el.importFile.addEventListener('change', () => {
-    const f = el.importFile.files[0];
-    el.importFile.value = '';
-    if (f) importBackup(f);
-  });
-
+  el.exportBtn.addEventListener('click', exportCsv);
   el.search.addEventListener('input', render);
 
   el.grid.addEventListener('click', async e => {
+    if (e.target.closest('.link-btn')) return;
     const copy = e.target.closest('[data-copy]');
     if (copy) {
-      e.stopPropagation();
       try { await navigator.clipboard.writeText(copy.dataset.copy); } catch { return; }
       copy.classList.add('copied');
       setTimeout(() => copy.classList.remove('copied'), 1100);
       return;
     }
-    const card = e.target.closest('.card');
+    const card = e.target.closest('.card[data-id]');
     if (card) openEditor(items.find(i => i.id === card.dataset.id));
   });
   el.grid.addEventListener('keydown', e => {
-    if (e.key === 'Enter' && e.target.classList.contains('card')) openEditor(items.find(i => i.id === e.target.dataset.id));
+    if (e.key === 'Enter' && e.target.matches('.card[data-id]')) openEditor(items.find(i => i.id === e.target.dataset.id));
   });
 
   el.form.addEventListener('submit', save);
   el.form.addEventListener('click', e => {
-    if (e.target.closest('[data-close]')) closeEditor();
-    const jump = e.target.closest('[data-jump]');
-    if (jump) {
-      const target = items.find(i => i.id === jump.dataset.jump);
-      closeEditor();
-      if (target) openEditor(target);
+    if (e.target.closest('[data-close]')) return closeEditor();
+    const t = e.target.closest('[data-jump],[data-use-name],[data-fill]');
+    if (!t) return;
+    const ref = items.find(i => i.id === (t.dataset.jump || t.dataset.useName || t.dataset.fill));
+    if (!ref) return;
+    if (t.dataset.jump) { closeEditor(); openEditor(ref); return; }
+    el.name.value = ref.name;
+    if (t.dataset.fill) {
+      el.sku.value = ref.sku;
+      if (!clean(el.url.value)) el.url.value = ref.url;
+      if (draft.photo === 'clear' && ref.photo) setDraftPhoto({ from: ref.id, hash: ref.photoHash, url: photoUrl(ref) });
+      if (!clean(el.unit.value)) el.unit.value = nextUnitId(ref.sku);
     }
+    validate();
   });
   el.editor.addEventListener('click', e => { if (e.target === el.editor) closeEditor(); });
 
-  el.name.addEventListener('input', validate);
-  el.sku.addEventListener('input', validate);
+  for (const input of [el.name, el.sku, el.unit, el.url]) input.addEventListener('input', validate);
+  el.url.addEventListener('blur', () => { const u = normalizeUrl(el.url.value); if (u) el.url.value = u; });
   el.genSku.addEventListener('click', () => { el.sku.value = nextSku(); validate(); el.sku.focus(); });
+  el.genUnit.addEventListener('click', () => { el.unit.value = nextUnitId(el.sku.value); validate(); el.unit.focus(); });
   el.del.addEventListener('click', onDelete);
+  el.clone.addEventListener('click', () => {
+    const src = editing;
+    closeEditor();
+    openEditor(null, src);
+  });
 
   el.drop.addEventListener('click', e => {
     if (e.target === el.clearPhoto) return;
@@ -532,7 +490,7 @@ function bind() {
   });
   el.clearPhoto.addEventListener('click', e => {
     e.stopPropagation();
-    setDraftPhoto(null, null, true);
+    setDraftPhoto('clear');
     validate();
   });
   el.photo.addEventListener('change', () => { acceptFile(el.photo.files[0]); el.photo.value = ''; });
@@ -549,29 +507,16 @@ function bind() {
       e.preventDefault();
       el.search.focus();
     }
-    if (e.key === 'Escape') toggleMenu(false);
   });
 
   const top = $('.top');
   addEventListener('scroll', () => top.classList.toggle('scrolled', scrollY > 4), { passive: true });
 
-  channel?.addEventListener('message', async () => {
-    await reload();
-    if (el.editor.open) validate();
-  });
+  // Pick up changes made by others
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) reload(); });
+  setInterval(() => { if (!document.hidden && !saving) reload(); }, REFRESH_MS);
 }
 
-/* ---------------- Boot ---------------- */
-
-(async function init() {
-  bind();
-  try {
-    db = await openDb();
-    await reload();
-  } catch (err) {
-    el.empty.hidden = false;
-    toast('הדפדפן חוסם שמירת נתונים מקומית (מצב גלישה פרטית?)', { bad: true, ms: 10000 });
-    console.error(err);
-  }
-  navigator.storage?.persist?.();
-})();
+bind();
+render();
+reload();

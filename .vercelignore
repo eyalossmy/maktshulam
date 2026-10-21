@@ -1,0 +1,4 @@
+.env*
+.claude
+scripts
+node_modules

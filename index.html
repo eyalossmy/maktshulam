@@ -33,21 +33,10 @@
       </span>
     </a>
     <div class="top-actions">
-      <div class="menu-wrap">
-        <button id="menuBtn" class="icon-btn" type="button" aria-label="אפשרויות נוספות" aria-haspopup="menu" aria-expanded="false">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg>
-        </button>
-        <div id="menu" class="menu" role="menu" hidden>
-          <button type="button" role="menuitem" data-action="export">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 4.5-4.5M12 15l-4.5-4.5M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
-            ייצוא גיבוי
-          </button>
-          <button type="button" role="menuitem" data-action="import">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15V3m0 0L7.5 7.5M12 3l4.5 4.5M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
-            ייבוא גיבוי
-          </button>
-        </div>
-      </div>
+      <button id="exportBtn" class="btn ghost" type="button" title="ייצוא לקובץ אקסל (CSV)">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 4.5-4.5M12 15l-4.5-4.5M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
+        <span>ייצוא</span>
+      </button>
       <button id="addBtn" class="btn primary" type="button">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
         <span>פריט חדש</span>
@@ -60,14 +49,14 @@
       <h1 class="headline">כל מק״ט —<br><span>פעם אחת בלבד.</span></h1>
       <div class="stats" aria-live="polite">
         <div class="stat"><strong id="count">0</strong><span>פריטים</span></div>
-        <div class="stat"><strong id="photoCount">0</strong><span>עם תמונה</span></div>
+        <div class="stat"><strong id="skuCount">0</strong><span>מק״טים</span></div>
       </div>
     </section>
 
     <div class="toolbar">
       <label class="search">
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4 4"/></svg>
-        <input id="search" type="search" placeholder="חיפוש לפי שם או מק״ט" autocomplete="off" spellcheck="false">
+        <input id="search" type="search" placeholder="חיפוש לפי שם, מק״ט או ID" autocomplete="off" spellcheck="false">
         <kbd aria-hidden="true">/</kbd>
       </label>
     </div>
@@ -79,7 +68,7 @@
         <span></span><span></span><span></span><span></span><span></span><span></span><span></span>
       </div>
       <h2>עוד אין פריטים</h2>
-      <p>הוסיפו את הפריט הראשון: שם, מק״ט ותמונה. כפילויות ייחסמו אוטומטית.</p>
+      <p>הוסיפו את הפריט הראשון: שם, מק״ט, ID ותמונה. כפילויות ייחסמו אוטומטית.</p>
       <button type="button" class="btn primary" data-action="add">הוספת פריט ראשון</button>
     </div>
 
@@ -121,17 +110,37 @@
       </div>
 
       <div class="field" id="skuField">
-        <label for="sku">מק״ט</label>
+        <label for="sku">מק״ט <span class="hint">· משותף לכל היחידות מאותו סוג</span></label>
         <div class="control">
-          <input id="sku" name="sku" class="code" dir="ltr" autocomplete="off" spellcheck="false" maxlength="40" placeholder="MK-10024">
+          <input id="sku" name="sku" class="code" dir="ltr" autocomplete="off" spellcheck="false" maxlength="40" placeholder="EVO-DRONE">
           <span class="status" aria-hidden="true"></span>
           <button id="genSku" type="button" class="chip-btn">יצירה אוטומטית</button>
         </div>
         <p id="skuMsg" class="msg" aria-live="polite"></p>
       </div>
 
+      <div class="field" id="unitField">
+        <label for="unitId">ID <span class="hint">· ייחודי לכל יחידה</span></label>
+        <div class="control">
+          <input id="unitId" name="unitId" class="code" dir="ltr" autocomplete="off" spellcheck="false" maxlength="40" placeholder="EVO-DRONE-001">
+          <span class="status" aria-hidden="true"></span>
+          <button id="genUnit" type="button" class="chip-btn">יצירה אוטומטית</button>
+        </div>
+        <p id="unitMsg" class="msg" aria-live="polite"></p>
+      </div>
+
+      <div class="field" id="urlField">
+        <label for="url">קישור <span class="hint">· לא חובה</span></label>
+        <div class="control">
+          <input id="url" name="url" type="url" inputmode="url" dir="ltr" autocomplete="off" spellcheck="false" maxlength="500" placeholder="https://">
+          <span class="status" aria-hidden="true"></span>
+        </div>
+        <p id="urlMsg" class="msg" aria-live="polite"></p>
+      </div>
+
       <div class="sheet-foot">
         <button id="deleteBtn" type="button" class="btn danger" hidden>מחיקה</button>
+        <button id="cloneBtn" type="button" class="btn ghost" hidden>+ יחידה נוספת</button>
         <span class="spacer"></span>
         <button type="button" class="btn ghost" data-close>ביטול</button>
         <button id="saveBtn" type="submit" class="btn primary">שמירה</button>
@@ -139,7 +148,6 @@
     </form>
   </dialog>
 
-  <input id="importFile" type="file" accept="application/json,.json" hidden>
   <div id="toasts" class="toasts" aria-live="polite"></div>
 </body>
 </html>

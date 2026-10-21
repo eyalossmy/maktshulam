@@ -1,0 +1,14 @@
+{
+  "name": "maktshulam",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "migrate": "node --env-file=.env.local scripts/migrate.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@neondatabase/serverless": "^1.2.0"
+  }
+}
